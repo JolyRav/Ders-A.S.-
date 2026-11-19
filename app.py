@@ -91,25 +91,75 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     return out
 
 def save_note(filename: str, raw: bytes, extracted: str):
+    """Dosyayı ve metin parçalarını Supabase'e kaydeder.
+
+    Storage nesne yolu yalnızca ASCII karakterlerden oluşturulur. Böylece
+    Türkçe karakter içeren orijinal dosya adları HTTP başlıklarına/path'e
+    taşınmaz; orijinal ad veritabanında aynen saklanır.
+    """
     digest = hashlib.sha256(raw).hexdigest()
-    existing = sb.table("notes").select("id").eq("sha256", digest).execute().data
+
+    try:
+        existing = (
+            sb.table("notes")
+            .select("id")
+            .eq("sha256", digest)
+            .execute()
+            .data
+        )
+    except Exception as e:
+        raise RuntimeError(f"Supabase not kontrolü hatası: {e}") from e
+
     if existing:
         return False, "Bu dosya zaten yüklenmiş."
+
     chunks = chunk_text(extracted)
     if not chunks:
-        raise ValueError("Dosyadan metin okunamadı. PDF taranmış görsel ise önce OCR uygulanmış sürümünü yükle.")
-    vectors = embed_texts(chunks)
-    storage_path = f"{digest}/{filename}"
-    sb.storage.from_(BUCKET).upload(
-        storage_path, raw,
-        file_options={"content-type": "application/octet-stream", "upsert": "true"}
-    )
-    note = sb.table("notes").insert({
-        "filename": filename,
-        "sha256": digest,
-        "storage_path": storage_path,
-        "chunk_count": len(chunks)
-    }).execute().data[0]
+        raise ValueError(
+            "Dosyadan metin okunamadı. PDF taranmış görsel ise OCR uygulanmış sürümünü yükle."
+        )
+
+    try:
+        vectors = embed_texts(chunks)
+    except Exception as e:
+        raise RuntimeError(f"OpenAI embedding hatası: {e}") from e
+
+    # Orijinal dosya adı Storage yoluna eklenmez; yalnızca güvenli uzantı kullanılır.
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in {".pdf", ".docx", ".txt", ".md"}:
+        ext = ".bin"
+    storage_path = f"{digest}{ext}"
+
+    try:
+        sb.storage.from_(BUCKET).upload(
+            storage_path,
+            raw,
+            file_options={
+                "content-type": "application/octet-stream",
+                "upsert": "true",
+            },
+        )
+    except Exception as e:
+        raise RuntimeError(f"Supabase dosya yükleme hatası: {e}") from e
+
+    try:
+        inserted = (
+            sb.table("notes")
+            .insert({
+                "filename": filename,
+                "sha256": digest,
+                "storage_path": storage_path,
+                "chunk_count": len(chunks),
+            })
+            .execute()
+            .data
+        )
+        if not inserted:
+            raise RuntimeError("Supabase notes tablosu kayıt döndürmedi.")
+        note = inserted[0]
+    except Exception as e:
+        raise RuntimeError(f"Supabase not kayıt hatası: {e}") from e
+
     rows = []
     for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
         rows.append({
@@ -117,10 +167,15 @@ def save_note(filename: str, raw: bytes, extracted: str):
             "filename": filename,
             "chunk_index": idx,
             "content": chunk,
-            "embedding": vector
+            "embedding": vector,
         })
-    for i in range(0, len(rows), 50):
-        sb.table("note_chunks").insert(rows[i:i+50]).execute()
+
+    try:
+        for i in range(0, len(rows), 50):
+            sb.table("note_chunks").insert(rows[i:i + 50]).execute()
+    except Exception as e:
+        raise RuntimeError(f"Supabase not parçaları kayıt hatası: {e}") from e
+
     return True, f"{filename}: {len(chunks)} parça olarak kaydedildi."
 
 def cosine(a, b):
